@@ -1,0 +1,352 @@
+// STUDY AREA
+var aoi = aoi.geometry();
+Map.centerObject(aoi, 14);
+Map.addLayer(aoi, {color: 'gray'}, 'AOI');
+
+var ps = ee.ImageCollection('projects/');
+
+// Cast all bands to Float (results from PIF)
+var castToFloat = function(image) {
+  // Get all band names
+  var bands = image.bandNames();
+  
+  // Cast each band to float
+  var castedImage = bands.iterate(function(bandName, img) {
+    bandName = ee.String(bandName);
+    var band = ee.Image(img).select([bandName]).toFloat();
+    return ee.Image(img).addBands(band, null, true);
+  }, image);
+  
+  return ee.Image(castedImage).copyProperties(image, image.propertyNames());
+};
+
+// Apply casting to entire collection
+ps = ps.map(castToFloat);
+
+// Filter by date and study area
+var filtered  = ps
+  .filter(ee.Filter.date('2024-05-01', '2024-10-31'))
+  .filter(ee.Filter.bounds(aoi))
+  .select('b.*');
+print('Jumlah citra:', filtered.size());
+
+// Create composite
+var collectionSize = filtered.size();
+
+// Display the imput Composite
+var visRGB = {
+  min   : 0,
+  max   : 3000,
+  bands : ['b6', 'b4', 'b2']
+};
+// Map.addLayer(composite.clip(aoi), visRGB, 'PlanetScope', false);
+
+// Calculate Spectral Indices
+var addIndices  = function(image) {
+  // Check available band images
+  var bandNames = image.bandNames();
+  print('Available bands:', bandNames);
+  
+  // Rescale Band
+  var BLUE  = image.select('b2').multiply(0.0001);
+  var GREEN = image.select('b4').multiply(0.0001);
+  var RED   = image.select('b6').multiply(0.0001);
+  var redEdge = image.select('b7').multiply(0.0001);
+  var NIR   = image.select('b8').multiply(0.0001);
+  
+  // Generate VIs
+  var ndvi  = image.normalizedDifference(['b8', 'b6']).rename(['NDVI']);
+  var evi   = NIR.subtract(RED).multiply(2.5)
+    .divide(NIR.add(RED.multiply(6)).subtract(BLUE.multiply(7.5)).add(1))
+    .rename('EVI');
+  var savi  = NIR.subtract(RED).multiply(1.5)
+    .divide(NIR.add(RED).add(0.5))
+    .rename('SAVI');
+  var tcari = redEdge.subtract(RED)
+    .multiply(3)
+    .subtract(
+      redEdge.subtract(GREEN)
+      .multiply(0.2)
+      .multiply(redEdge.divide(RED)))
+      .rename('TCARI');
+  var ci    = NIR.divide(redEdge).subtract(1).rename('CI');
+  var cvi   = NIR.multiply(
+    RED.divide(GREEN.pow(2)))
+    .rename('CVI');
+
+  return image.addBands([ndvi, evi, savi, tcari, ci, cvi]);
+};
+
+var composite = addIndices(composite);
+print('Composite bands after calculate indices:', composite.bandNames());
+
+// Merge training samples
+var sample  = ee.FeatureCollection([potato, nonPotato]).flatten();
+print('Total samples:', sample.size());
+
+// Stratified split approach - Use separate random for each class
+var potatoRandom = potato.randomColumn('random');
+var potatoTrain = potatoRandom.filter(ee.Filter.lt('random', 0.70));
+var potatoVal = potatoRandom.filter(ee.Filter.gte('random', 0.70));
+
+var nonPotatoRandom = nonPotato.randomColumn('random');
+var nonPotatoTrain = nonPotatoRandom.filter(ee.Filter.lt('random', 0.70));
+var nonPotatoVal = nonPotatoRandom.filter(ee.Filter.gte('random', 0.70));
+
+var trainingSample = ee.FeatureCollection([potatoTrain, nonPotatoTrain]).flatten();
+var validationSample = ee.FeatureCollection([potatoVal, nonPotatoVal]).flatten();
+
+print('Training sample total:', trainingSample.size());
+print('Validation sample total:', validationSample.size());
+
+// Function to stratified sampling
+var stratifiedSample = function(composite, samples, maxSamples) {
+  // Get unique classes
+  var classes = samples.aggregate_array('class').distinct();
+  print('Classes in samples:', classes);
+  
+  // Sample per class
+  var sampledPerClass = classes.map(function(classValue) {
+    classValue = ee.Number(classValue);
+    var classSamples = samples.filter(ee.Filter.eq('class', classValue));
+    var classSize = classSamples.size();
+
+    var samplesPerPolygon = ee.Number(maxSamples).divide(classSize).floor().max(1);
+
+    // Sample from composite
+    var sampled = composite.sampleRegions({
+      collection  : classSamples,
+      properties  : ['class'],
+      scale       : 3,
+      tileScale   : 16
+    });
+    
+    // Limit to maxSamples per class
+    sampled = sampled.limit(maxSamples);
+    return sampled;
+  });
+  
+  // Merge all class samples
+  var allSamples = ee.FeatureCollection(sampledPerClass).flatten();
+  
+  return allSamples;
+};
+
+var training = stratifiedSample(composite, trainingSample, MAX_SAMPLES);
+print('Training features extracted:', training.size());
+
+var class0Validation = composite.sampleRegions({
+  collection  : validationSample.filter(ee.Filter.eq('class', 0)),
+  properties  : ['class'],
+  scale       : 3,
+  tileScale   : 16,
+  geometries  : false
+}).randomColumn('random').sort('random').limit(MAX_SAMPLES);
+
+var class1Validation = composite.sampleRegions({
+  collection  : validationSample.filter(ee.Filter.eq('class', 1)),
+  properties  : ['class'],
+  scale       : 3,
+  tileScale   : 16,
+  geometries  : false
+}).randomColumn('random').sort('random').limit(MAX_SAMPLES);
+
+print('Class 0 (Potato) validation:', class0Validation.size());
+print('Class 1 (Non-Potato) validation:', class1Validation.size());
+
+var test = class0Validation.merge(class1Validation);
+print('Total test samples:', test.size());
+
+var testClass0 = test.filter(ee.Filter.eq('class', 0)).size();
+var testClass1 = test.filter(ee.Filter.eq('class', 1)).size();
+print('Test - Class 0:', testClass0, 'Class 1:', testClass1);
+
+var inputProperties = composite.bandNames();
+
+// === TUNING 1: Number of Trees ===
+var numTreesList = ee.List.sequence(10, 150, 20);
+
+var accuracies  = numTreesList.map(function(numTrees) {
+  var classifier  = ee.Classifier.smileRandomForest(numTrees)
+    .train({
+      features        : training,
+      classProperty   : 'class',
+      inputProperties : inputProperties
+    });
+  
+  // Classify validation set
+  return test
+    .classify(classifier)
+    .errorMatrix('class', 'classification')
+    .accuracy();
+});
+  
+// Display chart for number of trees
+var treeChart = ui.Chart.array.values({
+  array : ee.Array(accuracies),
+  axis  : 0,
+  xLabels: numTreesList
+}).setOptions({
+  title : 'Hyperparameter Tuning: Number of Trees',
+  vAxis : {title: 'Validation Accuracy', viewWindow: {min: 0.7, max: 1.0}},
+  hAxis : {title: 'Number of Trees', gridlines: {count: 8}},
+  pointSize : 5,
+  linewidth : 2,
+  series: {0: {color: '#1f77b4'}}
+});
+
+// print(treeChart);
+
+// === TUNING 2: Multiple Parameters (Number of Trees + Bag Fraction)
+var numTreesList2 = ee.List.sequence(10, 150, 20);
+var bagFractionList = ee.List.sequence(0.1, 0.9, 0.1);
+
+var tuningResults = numTreesList2.map(function(numTrees) {
+  return bagFractionList.map(function(bagFraction) {
+    var classifier = ee.Classifier.smileRandomForest({
+      numberOfTrees : numTrees,
+      bagFraction   : bagFraction,
+      seed          : 42,
+    }).train({
+      features      : training,
+      classProperty : 'class',
+      inputProperties: inputProperties
+    });
+  
+    // Classify and get accuracy
+    var accuracy = test
+      .classify(classifier)
+      .errorMatrix('class', 'classification')
+      .accuracy();
+      
+    return ee.Feature(null, {
+      'accuracy' : accuracy,
+      'numberOfTrees' : numTrees,
+      'bagFraction' : bagFraction
+    });
+  });
+}).flatten();
+  
+var resultFC = ee.FeatureCollection(tuningResults);
+var resultFCSorted = resultFC.sort('accuracy', false);
+
+// Get Optimal Tuning Parameter
+var highestAccuracyFeature = resultFCSorted.first();
+var highestAccuracy = highestAccuracyFeature.getNumber('accuracy');
+var optimalNumTrees = highestAccuracyFeature.getNumber('numberOfTrees');
+var optimalBagFraction = highestAccuracyFeature.getNumber('bagFraction');
+
+
+var optimalModel = ee.Classifier.smileRandomForest({
+  numberOfTrees: optimalNumTrees,
+  bagFraction: optimalBagFraction,
+  seed: 42
+}).train({
+  features: training,  
+  classProperty: 'class',
+  inputProperties: inputProperties
+});
+
+// Calculate variable importance from optimal model
+var importance = ee.Dictionary(optimalModel.explain().get('importance'));
+var sum = importance.values().reduce(ee.Reducer.sum());
+
+var relativeImportance = importance.map(function(key, val) {
+  return ee.Number(val).multiply(100).divide(sum);
+});
+print('\n--- FEATURE IMPORTANCE ---');
+print('Relative importance (%):', relativeImportance);
+
+// Create chart for feature importance
+var importanceFC = ee.FeatureCollection([
+  ee.Feature(null, relativeImportance)
+]);
+
+var importanceChart = ui.Chart.feature.byProperty({
+  features: importanceFC
+}).setOptions({
+  title: 'Feature Importance (Optimal Model)',
+  vAxis: {title: 'Importance (%)'},
+  hAxis: {title: 'Feature'},
+  legend: {position: 'none'},
+  colors: ['#2ca02c']
+});
+print(importanceChart);
+
+var finalClassification = composite.classify(optimalModel);
+
+var classVis = {
+  min: 0,
+  max: 1,
+  palette: ['#6F826A', '#F0F1C5']  // 0=Potato (green), 1=Non-Potato (beige)
+};
+
+Map.addLayer(finalClassification.clip(aoi), classVis, 'Classification Result', true);
+
+var validated = test.classify(optimalModel);
+
+// Confusion matrix
+var testCM = validated.errorMatrix('class', 'classification');
+
+print('\n--- CONFUSION MATRIX ---');
+print('Matrix:', testCM);
+print('Array:', testCM.array());
+
+// Overall metrics
+var overallAccuracy = testCM.accuracy();
+var kappaCoefficient = testCM.kappa();
+
+print('\n--- OVERALL METRICS ---');
+print('Overall Accuracy:', overallAccuracy);
+print('Kappa Coefficient:', kappaCoefficient);
+
+// Per-class metrics
+var producersAcc = testCM.producersAccuracy();
+var consumersAcc = testCM.consumersAccuracy();
+
+print('\n--- PER-CLASS METRICS ---');
+print('Producer\'s Accuracy:', producersAcc);
+print('Consumer\'s Accuracy:', consumersAcc);
+
+var producersFlat = ee.Array(producersAcc).toList().flatten();
+var consumersFlat = ee.Array(consumersAcc).toList().flatten();
+
+print('Producer\'s Accuracy (flattened):', producersFlat);
+print('Consumer\'s Accuracy (flattened):', consumersFlat);
+
+var class0PA = ee.Number(producersFlat.get(0));
+var class0UA = ee.Number(consumersFlat.get(0));
+var class1PA = ee.Number(producersFlat.get(1));
+var class1UA = ee.Number(consumersFlat.get(1));
+
+// F1-Scores
+var f1Class0 = ee.Number(class0PA).multiply(class0UA).multiply(2)
+  .divide(ee.Number(class0PA).add(class0UA));
+
+var f1Class1 = ee.Number(class1PA).multiply(class1UA).multiply(2)
+  .divide(ee.Number(class1PA).add(class1UA));
+
+// Overall chart
+var overallData = ee.FeatureCollection([
+  ee.Feature(null, {'Metric': 'Overall Accuracy', 'Value': overallAccuracy.multiply(100)}),
+  ee.Feature(null, {'Metric': 'Kappa', 'Value': kappaCoefficient.multiply(100)}),
+  ee.Feature(null, {'Metric': 'Potato F1', 'Value': f1Class0.multiply(100)}),
+  ee.Feature(null, {'Metric': 'Non-Potato F1', 'Value': f1Class1.multiply(100)})
+]);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
