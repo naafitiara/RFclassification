@@ -1,13 +1,11 @@
-// STUDY AREA
-var aoi = aoi.geometry();
 Map.centerObject(aoi, 14);
-Map.addLayer(aoi, {color: 'gray'}, 'AOI');
+Map.addLayer(aoi, {color: 'gray'}, 'Study Area');
 
-var ps = ee.ImageCollection('projects/');
+// Load PlanetScope Time Series
+var ps = ee.ImageCollection('projects/ee-');
 
-// Cast all bands to Float (results from PIF)
+// Cast all bands to Float
 var castToFloat = function(image) {
-  // Get all band names
   var bands = image.bandNames();
   
   // Cast each band to float
@@ -19,11 +17,9 @@ var castToFloat = function(image) {
   
   return ee.Image(castedImage).copyProperties(image, image.propertyNames());
 };
-
-// Apply casting to entire collection
 ps = ps.map(castToFloat);
 
-// Filter by date and study area
+// Filter PlanetScope by date and study area
 var filtered  = ps
   .filter(ee.Filter.date('2024-05-01', '2024-10-31'))
   .filter(ee.Filter.bounds(aoi))
@@ -32,14 +28,6 @@ print('Jumlah citra:', filtered.size());
 
 // Create composite
 var collectionSize = filtered.size();
-
-// Display the imput Composite
-var visRGB = {
-  min   : 0,
-  max   : 3000,
-  bands : ['b6', 'b4', 'b2']
-};
-// Map.addLayer(composite.clip(aoi), visRGB, 'PlanetScope', false);
 
 // Calculate Spectral Indices
 var addIndices  = function(image) {
