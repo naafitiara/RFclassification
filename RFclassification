@@ -26,23 +26,17 @@ var filtered  = ps
   .select('b.*');
 print('Jumlah citra:', filtered.size());
 
-// Create composite
-var collectionSize = filtered.size();
-
 // Calculate Spectral Indices
 var addIndices  = function(image) {
-  // Check available band images
   var bandNames = image.bandNames();
-  print('Available bands:', bandNames);
   
-  // Rescale Band
   var BLUE  = image.select('b2').multiply(0.0001);
   var GREEN = image.select('b4').multiply(0.0001);
   var RED   = image.select('b6').multiply(0.0001);
   var redEdge = image.select('b7').multiply(0.0001);
   var NIR   = image.select('b8').multiply(0.0001);
   
-  // Generate VIs
+  // Generate Vegetation Indices
   var ndvi  = image.normalizedDifference(['b8', 'b6']).rename(['NDVI']);
   var evi   = NIR.subtract(RED).multiply(2.5)
     .divide(NIR.add(RED.multiply(6)).subtract(BLUE.multiply(7.5)).add(1))
@@ -66,13 +60,11 @@ var addIndices  = function(image) {
 };
 
 var composite = addIndices(composite);
-print('Composite bands after calculate indices:', composite.bandNames());
 
-// Merge training samples
+// Training samples
 var sample  = ee.FeatureCollection([potato, nonPotato]).flatten();
 print('Total samples:', sample.size());
 
-// Stratified split approach - Use separate random for each class
 var potatoRandom = potato.randomColumn('random');
 var potatoTrain = potatoRandom.filter(ee.Filter.lt('random', 0.70));
 var potatoVal = potatoRandom.filter(ee.Filter.gte('random', 0.70));
@@ -162,28 +154,11 @@ var accuracies  = numTreesList.map(function(numTrees) {
       inputProperties : inputProperties
     });
   
-  // Classify validation set
   return test
     .classify(classifier)
     .errorMatrix('class', 'classification')
     .accuracy();
 });
-  
-// Display chart for number of trees
-var treeChart = ui.Chart.array.values({
-  array : ee.Array(accuracies),
-  axis  : 0,
-  xLabels: numTreesList
-}).setOptions({
-  title : 'Hyperparameter Tuning: Number of Trees',
-  vAxis : {title: 'Validation Accuracy', viewWindow: {min: 0.7, max: 1.0}},
-  hAxis : {title: 'Number of Trees', gridlines: {count: 8}},
-  pointSize : 5,
-  linewidth : 2,
-  series: {0: {color: '#1f77b4'}}
-});
-
-// print(treeChart);
 
 // === TUNING 2: Multiple Parameters (Number of Trees + Bag Fraction)
 var numTreesList2 = ee.List.sequence(10, 150, 20);
@@ -201,7 +176,6 @@ var tuningResults = numTreesList2.map(function(numTrees) {
       inputProperties: inputProperties
     });
   
-    // Classify and get accuracy
     var accuracy = test
       .classify(classifier)
       .errorMatrix('class', 'classification')
@@ -242,24 +216,6 @@ var sum = importance.values().reduce(ee.Reducer.sum());
 var relativeImportance = importance.map(function(key, val) {
   return ee.Number(val).multiply(100).divide(sum);
 });
-print('\n--- FEATURE IMPORTANCE ---');
-print('Relative importance (%):', relativeImportance);
-
-// Create chart for feature importance
-var importanceFC = ee.FeatureCollection([
-  ee.Feature(null, relativeImportance)
-]);
-
-var importanceChart = ui.Chart.feature.byProperty({
-  features: importanceFC
-}).setOptions({
-  title: 'Feature Importance (Optimal Model)',
-  vAxis: {title: 'Importance (%)'},
-  hAxis: {title: 'Feature'},
-  legend: {position: 'none'},
-  colors: ['#2ca02c']
-});
-print(importanceChart);
 
 var finalClassification = composite.classify(optimalModel);
 
@@ -275,66 +231,17 @@ var validated = test.classify(optimalModel);
 
 // Confusion matrix
 var testCM = validated.errorMatrix('class', 'classification');
-
-print('\n--- CONFUSION MATRIX ---');
 print('Matrix:', testCM);
 print('Array:', testCM.array());
 
 // Overall metrics
 var overallAccuracy = testCM.accuracy();
 var kappaCoefficient = testCM.kappa();
-
-print('\n--- OVERALL METRICS ---');
 print('Overall Accuracy:', overallAccuracy);
 print('Kappa Coefficient:', kappaCoefficient);
 
 // Per-class metrics
 var producersAcc = testCM.producersAccuracy();
 var consumersAcc = testCM.consumersAccuracy();
-
-print('\n--- PER-CLASS METRICS ---');
 print('Producer\'s Accuracy:', producersAcc);
 print('Consumer\'s Accuracy:', consumersAcc);
-
-var producersFlat = ee.Array(producersAcc).toList().flatten();
-var consumersFlat = ee.Array(consumersAcc).toList().flatten();
-
-print('Producer\'s Accuracy (flattened):', producersFlat);
-print('Consumer\'s Accuracy (flattened):', consumersFlat);
-
-var class0PA = ee.Number(producersFlat.get(0));
-var class0UA = ee.Number(consumersFlat.get(0));
-var class1PA = ee.Number(producersFlat.get(1));
-var class1UA = ee.Number(consumersFlat.get(1));
-
-// F1-Scores
-var f1Class0 = ee.Number(class0PA).multiply(class0UA).multiply(2)
-  .divide(ee.Number(class0PA).add(class0UA));
-
-var f1Class1 = ee.Number(class1PA).multiply(class1UA).multiply(2)
-  .divide(ee.Number(class1PA).add(class1UA));
-
-// Overall chart
-var overallData = ee.FeatureCollection([
-  ee.Feature(null, {'Metric': 'Overall Accuracy', 'Value': overallAccuracy.multiply(100)}),
-  ee.Feature(null, {'Metric': 'Kappa', 'Value': kappaCoefficient.multiply(100)}),
-  ee.Feature(null, {'Metric': 'Potato F1', 'Value': f1Class0.multiply(100)}),
-  ee.Feature(null, {'Metric': 'Non-Potato F1', 'Value': f1Class1.multiply(100)})
-]);
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
